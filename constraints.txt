@@ -1,0 +1,37 @@
+# constraints.txt — single source of truth for shared dependency versions
+# across IASSIS Medical Group services.
+#
+# Consumers install with:
+#     pip install -r requirements.txt -c <url-to-this-file>
+#
+# Bumping a version: edit, tag a new iassis-auth release (e.g. v0.2.0),
+# then update the @v0.x.y pin in each consumer's requirements.txt.
+#
+# Pin policy: lock direct deps tightly, and the load-bearing transitives
+# (starlette, pydantic-core, argon2-cffi) that have caused real breakage
+# in the past. Leave the long tail (anyio, idna, sniffio, etc.) to pip's
+# resolver — over-pinning them just creates conflicts with consumer apps.
+
+# --- iassis-auth direct deps ---
+fastapi==0.115.6
+PyJWT==2.10.1
+pwdlib==0.2.1
+argon2-cffi==23.1.0
+PyYAML==6.0.2
+pydantic==2.10.4
+pydantic-settings==2.7.0
+
+# --- load-bearing transitives ---
+starlette==0.41.3
+pydantic-core==2.27.2
+argon2-cffi-bindings==21.2.0
+
+# --- common across all consumer projects (not deps of iassis-auth itself,
+#     but every service uses them — pinning here keeps them aligned) ---
+pymongo==4.10.1
+uvicorn==0.34.0
+httpx==0.28.1
+python-multipart==0.0.20
+
+# --- dev / test (only enforced when consumers install dev extras) ---
+pytest==8.3.4
