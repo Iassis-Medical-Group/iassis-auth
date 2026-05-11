@@ -1,0 +1,7 @@
+fastapi
+PyJWT==2.12.1
+pwdlib[argon2]
+pwdlib[argon2id]
+pydantic-settings
+
+pydantic
