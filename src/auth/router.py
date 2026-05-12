@@ -86,11 +86,9 @@ def create_auth_router(
             HTTPException 403: User exists but `is_active=False`.
         """
         user = get_user_fn(body.username)
-        if user is None:
+        if user is None or not user.is_active:
             hasher.dummy_verify()
             raise HTTPException(status_code=401, detail="Unauthorized")
-        if not user.is_active:
-            raise HTTPException(status_code=403, detail="Account disabled")
         if not hasher.verify(body.password, user.password_hash):
             raise HTTPException(status_code=401, detail="Unauthorized")
 
