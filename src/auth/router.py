@@ -56,10 +56,6 @@ def create_auth_router(
                 "model": ErrorResponse,
                 "description": "Invalid credentials or unknown user.",
             },
-            403: {
-                "model": ErrorResponse,
-                "description": "Account is disabled (`is_active=False`).",
-            },
         },
     )
     def login(body: InLogin, response: Response) -> TokenResponse:
@@ -83,7 +79,6 @@ def create_auth_router(
 
         Raises:
             HTTPException 401: Unknown user or wrong password.
-            HTTPException 403: User exists but `is_active=False`.
         """
         user = get_user_fn(body.username)
         if user is None:
