@@ -89,8 +89,6 @@ def create_auth_router(
         if user is None:
             hasher.dummy_verify()
             raise HTTPException(status_code=401, detail="Unauthorized")
-        if not user.is_active:
-            raise HTTPException(status_code=403, detail="Account disabled")
         if not hasher.verify(body.password, user.password_hash):
             raise HTTPException(status_code=401, detail="Unauthorized")
 

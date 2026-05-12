@@ -181,11 +181,11 @@ def create_access_token(
         Encoded JWT string.
     """
     payload = {
+        **(extra or {}),
         "sub": identity,
         "roles": roles,
         "type": "access",
         "exp": datetime.now(timezone.utc) + timedelta(minutes=settings.access_ttl_minutes),
-        **(extra or {}),
     }
     return jwt.encode(
         payload,
@@ -229,9 +229,11 @@ def create_refresh_token(
 def decode_token(settings: AuthSettings, token: str) -> dict:
     """Decode and validate a JWT, returning its payload.
 
-    Validates signature and expiry. Does NOT check the `type` field —
-    callers must inspect `payload["type"]` themselves to distinguish
-    access vs. refresh.
+    Validates signature and expiry. Requires `exp`, `sub`, and `type` to
+    be present — a token missing any of these is rejected with
+    `jwt.MissingRequiredClaimError` (a subclass of `jwt.InvalidTokenError`).
+    Does NOT enforce a specific `type` value — callers must inspect
+    `payload["type"]` themselves to distinguish access vs. refresh.
 
     Args:
         settings: Loaded `AuthSettings`.
@@ -242,10 +244,12 @@ def decode_token(settings: AuthSettings, token: str) -> dict:
 
     Raises:
         jwt.ExpiredSignatureError: Token `exp` is in the past.
+        jwt.MissingRequiredClaimError: `exp`, `sub`, or `type` missing.
         jwt.InvalidTokenError: Signature mismatch or malformed token.
     """
     return jwt.decode(
         token,
         settings.jwt_secret_key.get_secret_value(),
         algorithms=[settings.jwt_algorithm],
+        options={"require": ["exp", "sub", "type"]},
     )
