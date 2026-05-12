@@ -64,7 +64,7 @@ class UserRecord(BaseModel):
     )
     is_active: bool = Field(
         default=True,
-        description="If False, login returns 403 and refresh returns 401.",
+        description="If False, login returns 401.",
     )
     extra_claims: dict = Field(
         default_factory=dict,
