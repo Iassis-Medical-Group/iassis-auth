@@ -29,6 +29,10 @@ Once a `vX.Y.Z` tag exists on the internal GitHub repo, pin it in your consumer'
 ```
 iassis-auth @ git+ssh://git@github.com/Iassis-Medical-Group/iassis-auth.git@v0.1.0
 ```
+or, if `git` cli is not available
+```
+iassis-auth @ git+https://github.com/Iassis-Medical-Group/iassis-auth.git@v0.1.0
+```
 
 Install with the shared constraints file so every service uses the same versions of FastAPI / pwdlib / PyJWT / pydantic:
 
