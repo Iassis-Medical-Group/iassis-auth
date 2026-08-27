@@ -286,7 +286,10 @@ def list_customers(user: dict = Depends(require_roles(["admin", "agent"]))):
 ## Migration notes (from the old password/JWT version)
 
 This is a breaking rewrite — v0.1.x's username/password login is gone
-entirely, replaced by Keycloak. Note in particular:
+entirely, replaced by Keycloak. For a full step-by-step walkthrough of
+migrating an existing consumer app, see
+[`docs/migrating-0.1-to-0.2.md`](docs/migrating-0.1-to-0.2.md). Summary of
+what changed:
 
 - **`POST /login` (JSON body) → `GET /login` (browser redirect).** The SPA
   can no longer `fetch()` a login; it must navigate the browser
