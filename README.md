@@ -2,19 +2,35 @@
 
 Shared FastAPI authentication library for IASSIS Medical Group internal services.
 
-Provides JWT access/refresh tokens, argon2id password hashing with a deployment-wide pepper, and role-based route protection — wired into any FastAPI app via a single `create_auth_router(...)` call. The library performs **no database I/O** itself; each consuming project supplies a `get_user_fn` callback so the same library works against personnel, influencer, or any other user collection.
+Keycloak is the identity provider. This library is a thin, reusable
+FastAPI "BFF" (backend-for-frontend) layer around Keycloak's OIDC
+Authorization Code flow: it redirects the browser to Keycloak to log in,
+exchanges the code server-side, and holds the result in an
+itsdangerous-signed Starlette session cookie. **No password is ever
+stored by this library, and no token is ever handed to the browser** —
+the session cookie is the only thing the client holds.
 
 ---
 
 ## Features
 
-- **Argon2id password hashing** via `pwdlib`, with per-password random salt.
-- **Deployment pepper** mixed in via HMAC-SHA256 pre-hash — pepper never reaches the database.
-- **JWT access + refresh tokens** (`HS256` by default), refresh token stored as `HttpOnly` cookie.
-- **Role-based dependencies** (`require_roles(["admin"])`) for protecting endpoints.
-- **Schema-agnostic**: consumer supplies a `get_user_fn` adapter, so nested (`auth.username`) or flat user documents are both supported.
-- **Constant-time decoy** on missing-user login path to prevent username enumeration via timing.
-- **Pure functions for tokens**; factory-built dependencies and hashers — no hidden module-level globals or state.
+- **Keycloak login / callback / logout**, mirroring the standard
+  Authorization Code (confidential client) flow — no PKCE, no client
+  secret in the browser.
+- **Starlette signed-cookie session** (`itsdangerous`) — no database, no
+  server-side session store. `configure_session(app, settings)` wires it
+  up with sane defaults.
+- **Role-based dependencies** (`require_roles(["admin"])`), reading roles
+  out of the session's Keycloak claims rather than decoding a bearer JWT.
+- **RP-initiated logout** — `/logout` ends this app's session *and*
+  redirects through Keycloak's `end_session_endpoint`, so the realm-wide
+  SSO session ends too.
+- **Optional local-user enrichment hook** (`get_or_create_user_fn`) for
+  syncing a Keycloak login to your own DB record — never a login gate;
+  Keycloak alone decides who can authenticate.
+- **No database I/O of its own.** Same as before: the library only knows
+  how to talk to Keycloak and manage the session; your app's routes decide
+  what an authenticated session can access.
 
 ---
 
@@ -27,18 +43,18 @@ Three install paths depending on where you are in the release cycle.
 Once a `vX.Y.Z` tag exists on the internal GitHub repo, pin it in your consumer's `requirements.txt`:
 
 ```
-iassis-auth @ git+ssh://git@github.com/Iassis-Medical-Group/iassis-auth.git@v0.1.0
+iassis-auth @ git+ssh://git@github.com/Iassis-Medical-Group/iassis-auth.git@v0.2.0
 ```
 or, if `git` cli is not available
 ```
-iassis-auth @ git+https://github.com/Iassis-Medical-Group/iassis-auth.git@v0.1.0
+iassis-auth @ git+https://github.com/Iassis-Medical-Group/iassis-auth.git@v0.2.0
 ```
 
-Install with the shared constraints file so every service uses the same versions of FastAPI / pwdlib / PyJWT / pydantic:
+Install with the shared constraints file so every service uses the same versions of FastAPI / httpx / PyJWT / pydantic:
 
 ```bash
 pip install -r requirements.txt \
-    -c https://raw.githubusercontent.com/Iassis-Medical-Group/iassis-auth/v0.1.0/constraints.txt
+    -c https://raw.githubusercontent.com/Iassis-Medical-Group/iassis-auth/v0.2.0/constraints.txt
 ```
 
 To bump a shared dependency org-wide: edit `constraints.txt` in this repo, tag a new release, and update the `@v0.x.y` pin in each consumer.
@@ -63,13 +79,13 @@ Build the wheel once:
 ```bash
 # from iassis-auth/
 python -m pip install build
-python -m build --wheel        # → dist/iassis_auth-0.1.0-py3-none-any.whl
+python -m build --wheel        # → dist/iassis_auth-0.2.0-py3-none-any.whl
 ```
 
 Copy the wheel into the consumer project (e.g. `consumer/vendor/`) and reference it in `requirements.txt`:
 
 ```
-./vendor/iassis_auth-0.1.0-py3-none-any.whl
+./vendor/iassis_auth-0.2.0-py3-none-any.whl
 ```
 
 In the consumer's `Dockerfile`, copy the vendor dir **before** the `pip install` step so the wheel is available at install time:
@@ -90,16 +106,21 @@ Rebuild and re-vendor the wheel whenever `iassis-auth` changes.
 
 All settings are read from environment variables (or a `.env` file) prefixed with `AUTH_`:
 
-| Variable                   | Type                       | Default               | Notes                                                       |
-| -------------------------- | -------------------------- | --------------------- | ----------------------------------------------------------- |
-| `AUTH_JWT_SECRET_KEY`      | secret string              | **required**          | Signs JWTs. Use ≥ 32 random bytes.                          |
-| `AUTH_PEPPER_SECRET`       | secret string              | **required**          | HMAC key mixed into every password hash. Never reaches DB.  |
-| `AUTH_JWT_ALGORITHM`       | string                     | `HS256`               |                                                             |
-| `AUTH_ACCESS_TTL_MINUTES`  | int                        | `480`                 | Access token lifetime.                                      |
-| `AUTH_REFRESH_TTL_MINUTES` | int                        | `1440`                | Refresh token lifetime.                                     |
-| `AUTH_REFRESH_COOKIE_PATH` | string                     | `/api/auth/refresh`   | Cookie scope path.                                          |
-| `AUTH_SECURE_COOKIE`       | bool                       | `true`                | Set `false` only for local HTTP dev.                        |
-| `AUTH_COOKIE_SAMESITE`     | `strict` / `lax` / `none`  | `strict`              |                                                             |
+| Variable | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `AUTH_KEYCLOAK_URL` | string | **required** | e.g. `https://idp.img.com.gr`, no trailing slash. |
+| `AUTH_KEYCLOAK_REALM` | string | `master` | Use a **dedicated realm** in any real deployment — `master` is fine for a quick local test only. |
+| `AUTH_KEYCLOAK_CLIENT_ID` | string | **required** | This app's Keycloak client id. |
+| `AUTH_KEYCLOAK_CLIENT_SECRET` | secret string | **required** | From the client's Credentials tab (confidential client). |
+| `AUTH_KEYCLOAK_SCOPE` | string | `openid profile email` | |
+| `AUTH_APP_BASE_URL` | string | **required** | This app's own public URL, no trailing slash. Used to derive the Keycloak callback URL (`{prefix}/callback`) — register that exact URL as a Valid Redirect URI in Keycloak. |
+| `AUTH_POST_LOGIN_REDIRECT_PATH` | string | `/` | Where the browser lands after a successful login. |
+| `AUTH_POST_LOGOUT_REDIRECT_PATH` | string | `/` | Where the browser lands after Keycloak's logout redirect. |
+| `AUTH_SESSION_SECRET_KEY` | secret string | **required** | Signs the session cookie. Use ≥ 32 random bytes. |
+| `AUTH_SESSION_COOKIE_NAME` | string | `session` | |
+| `AUTH_SESSION_MAX_AGE_SECONDS` | int or unset | Starlette default (14 days) | |
+| `AUTH_SESSION_HTTPS_ONLY` | bool | `true` | Set `false` only for local HTTP dev. |
+| `AUTH_ROLES_SOURCE` | `realm` / `resource` / `both` | `both` | Which claim location `require_roles(...)` reads. |
 
 Generate strong secrets:
 
@@ -107,24 +128,19 @@ Generate strong secrets:
 python -c "import secrets; print(secrets.token_urlsafe(64))"
 ```
 
-### Argon2id parameters (optional)
+### Keycloak-side setup this depends on
 
-By default the hasher uses sane argon2id parameters (t=3, m=64 MiB, p=4, hash_len=32, salt_len=16). Override by passing a YAML config path:
-
-```yaml
-# hasher-config.yaml
-time_cost: 3
-memory_cost: 65536
-parallelism: 4
-hash_len: 32
-salt_len: 16
-```
-
-```python
-hasher = make_password_hasher(settings, hasher_config_path="./hasher-config.yaml")
-```
-
-Tune `memory_cost` / `time_cost` to target ~100 ms per hash on production hardware.
+- **Redirect URI**: the client's Valid Redirect URIs must include exactly
+  `{AUTH_APP_BASE_URL}{prefix}/callback` (default prefix `/api/auth`).
+- **Roles in claims**: `require_roles([...])` reads
+  `realm_access.roles` / `resource_access[client_id].roles` from the
+  verified id_token + userinfo. Those only appear if the client's
+  **"roles" client scope is a Default scope** with **"Add to ID token"**
+  enabled on its mappers. If that's missing, `roles` is silently always
+  empty and every `require_roles([...])` call denies everyone — check
+  this first if logins succeed but every protected route 403s.
+- **Realm**: don't run real app clients against `master` — create a
+  dedicated realm for this org's applications.
 
 ---
 
@@ -133,92 +149,62 @@ Tune `memory_cost` / `time_cost` to target ~100 ms per hash on production hardwa
 ```python
 # main.py
 from fastapi import Depends, FastAPI
-from pymongo import MongoClient
 
-from auth import (
-    AuthSettings,
-    UserRecord,
-    create_auth_router,
-    make_password_hasher,
-    make_require_roles,
-)
+from auth import AuthSettings, configure_session, create_auth_router, make_require_roles
 
 app = FastAPI()
 
 # 1. Load AUTH_* env vars
 settings = AuthSettings()
 
-# 2. Build the password hasher (pepper bound here)
-hasher = make_password_hasher(settings)
+# 2. Attach the session middleware — must happen before include_router()
+configure_session(app, settings)
 
 # 3. Build the role-checking dependency factory
 require_roles = make_require_roles(settings)
 
-# 4. Adapter: read your DB, return the normalized UserRecord shape
-personnel = MongoClient("mongodb://localhost:27017")["mydb"]["personnel"]
+# 4. Mount the auth router
+app.include_router(create_auth_router(settings=settings))
 
-def get_user(username: str) -> UserRecord | None:
-    doc = personnel.find_one({"auth.username": username})
-    if not doc:
-        return None
-    a = doc["auth"]
-    return UserRecord(
-        identity=a["username"],
-        password_hash=a["password_hash"],
-        roles=a.get("roles", []),
-        is_active=a.get("is_active", True),
-    )
-
-# 5. Mount the auth router
-app.include_router(create_auth_router(
-    settings=settings,
-    hasher=hasher,
-    get_user_fn=get_user,
-))
-
-# 6. Protect your own routes
+# 5. Protect your own routes
 @app.get("/admin/stats")
-def stats(claims: dict = Depends(require_roles(["admin"]))):
-    return {"by": claims["sub"]}
+def stats(user: dict = Depends(require_roles(["admin"]))):
+    return {"by": user["sub"]}
 
 @app.get("/me")
-def me(claims: dict = Depends(require_roles.get_current_claims)):
-    return claims
+def me(user: dict = Depends(require_roles.get_current_claims)):
+    return user
 ```
 
-This gives you three endpoints out of the box:
+This gives you four endpoints out of the box, all `GET` (this is a
+browser-redirect flow, not a JSON API):
 
-| Method | Path                  | Purpose                                              |
-| ------ | --------------------- | ---------------------------------------------------- |
-| POST   | `/api/auth/login`     | Verify credentials, set refresh cookie, return token |
-| POST   | `/api/auth/refresh`   | Mint a fresh access token from the refresh cookie    |
-| POST   | `/api/auth/logout`    | Clear the refresh cookie                             |
+| Method | Path | Purpose |
+| --- | --- | --- |
+| GET | `/api/auth/login` | Redirect the browser to Keycloak. Supports `?prompt=none` for a silent SSO probe. |
+| GET | `/api/auth/callback` | Keycloak's redirect target — exchanges the code, populates the session, redirects home. |
+| GET | `/api/auth/logout` | Clear the session and end Keycloak's SSO session (RP-initiated logout). |
+| GET | `/api/auth/me` | `{"authenticated": bool, "user"?: {...}}` for the current session. |
 
-Override the prefix: `create_auth_router(..., prefix="/v2/auth")`.
+Override the prefix: `create_auth_router(..., prefix="/v2/auth")` — the callback URL registered in Keycloak must match whatever prefix you choose.
 
 ---
 
 ## Recommended wiring: a consumer-side `app_auth/` package
 
-Splatting the Quick-start snippet into `main.py` works for a single-file app. For anything real, **put the wiring in its own module** (e.g. `your_project/app_auth/__init__.py`) and import the resulting objects from there. This buys three things: one place to load settings, one shared `hasher`/`require_roles` per process, and one `get_user_fn` definition that every protected route reaches through the same import path.
+Splatting the Quick-start snippet into `main.py` works for a single-file app. For anything real, **put the wiring in its own module** (e.g. `your_project/app_auth/__init__.py`) and import the resulting objects from there. This buys one place to load settings and one shared `require_roles` per process that every protected route reaches through the same import path.
 
 ### Why not just call it `auth/`?
 
-The library is published as the top-level package **`auth`**. If your project also has a directory named `api/src/auth/`, Python's import system will resolve `from auth import ...` to your local dir before the installed library — silent shadowing that breaks the library import. Name your local wiring module anything else; `app_auth/` is the convention used by the IASSIS competitor-analysis service.
+The library is published as the top-level package **`auth`**. If your project also has a directory named `api/src/auth/`, Python's import system will resolve `from auth import ...` to your local dir before the installed library — silent shadowing that breaks the library import. Name your local wiring module anything else; `app_auth/` is the convention used across IASSIS services.
 
 ### The wiring module
 
 ```python
 # your_project/app_auth/__init__.py
-"""Local wiring of the shared `iassis-auth` library against this service's user collection."""
+"""Local wiring of the shared `iassis-auth` library for this service."""
 
-from auth import (
-    AuthSettings,
-    UserRecord,
-    create_auth_router,
-    make_password_hasher,
-    make_require_roles,
-)
+from auth import AuthSettings, configure_session, create_auth_router, make_require_roles
 
 from db.db import auth_db  # your project's MongoClient / collection accessor
 
@@ -226,57 +212,51 @@ from db.db import auth_db  # your project's MongoClient / collection accessor
 # 1. Load AUTH_* env vars once per process.
 settings = AuthSettings()
 
-# 2. Build the hasher once (pepper-bound; pwdlib instance is reused).
-hasher = make_password_hasher(settings)
-
-# 3. Build the role-checking factory once. Routes import this symbol.
+# 2. Build the role-checking factory once. Routes import this symbol.
 require_roles = make_require_roles(settings)
 
 
-# 4. Adapter: read your DB, return the normalised UserRecord shape.
-def _get_user(username: str) -> UserRecord | None:
-    doc = auth_db["personnel"].find_one({"auth.username": username})
-    if not doc:
-        return None
-    a = doc.get("auth", {})
-    return UserRecord(
-        identity=a.get("username", username),
-        password_hash=a.get("password_hash", ""),
-        roles=a.get("roles", []),
-        is_active=a.get("is_active", True),
-    )
+# 3. Optional: sync a Keycloak login to your own DB record. Enrichment
+#    only — returning None still lets the user log in; it just means the
+#    session's `user` dict has no `local` key. Gate access to specific
+#    routes with `require_roles([...])`, not by rejecting login here.
+def _get_or_create_user(claims: dict) -> dict | None:
+    return auth_db["personnel"].find_one({"keycloak_sub": claims["sub"]})
 
 
-# 5. Build the router. Pick a prefix that matches your existing frontend
-#    expectations (default `/api/auth`, here `/api/jwt` to preserve the
-#    pre-existing client). Cookie path is set via AUTH_REFRESH_COOKIE_PATH.
+# 4. Build the router. Pick a prefix that matches your existing frontend
+#    expectations (default `/api/auth`).
 router = create_auth_router(
     settings=settings,
-    hasher=hasher,
-    get_user_fn=_get_user,
-    prefix="/api/jwt",
+    get_or_create_user_fn=_get_or_create_user,
+    prefix="/api/auth",
 )
 
-__all__ = ["router", "require_roles", "hasher", "settings"]
+__all__ = ["router", "require_roles", "settings"]
 ```
+
+`configure_session(app, settings)` is **not** called here — it attaches
+middleware, which must run against the actual `FastAPI()` instance in
+`main.py`, before any router (including this one) is mounted.
 
 ### What each export is for
 
 | Export          | Used by                                                                 |
-| --------------- | ----------------------------------------------------------------------- |
+| --------------- | ------------------------------------------------------------------------ |
 | `router`        | `app.py` does `app.include_router(router)` once at startup.             |
 | `require_roles` | Every protected route: `Depends(require_roles(["admin"]))`.             |
-| `hasher`        | Seed / registration / password-reset scripts that need `hasher.hash()`. |
-| `settings`      | Rare — only if you need to read TTLs or cookie config elsewhere.        |
+| `settings`      | `app.py` needs it for `configure_session(app, settings)`.                |
 
 ### How the rest of the app uses it
 
 ```python
 # app.py
 from fastapi import FastAPI
-from app_auth import router as auth_router
+from auth import configure_session
+from app_auth import router as auth_router, settings
 
 app = FastAPI()
+configure_session(app, settings)
 app.include_router(auth_router)
 # ... include your other routers ...
 ```
@@ -289,69 +269,86 @@ from app_auth import require_roles
 router = APIRouter(prefix="/api/customers")
 
 @router.get("")
-def list_customers(claims: dict = Depends(require_roles(["admin", "agent"]))):
+def list_customers(user: dict = Depends(require_roles(["admin", "agent"]))):
     ...
 ```
 
 ### Things to check in your wiring
 
-- **One `AuthSettings()` call per process.** Importing `app_auth` triggers env-var parsing; missing `AUTH_JWT_SECRET_KEY` or `AUTH_PEPPER_SECRET` fails at import time, which is what you want (loud at boot, not on first login).
-- **One `make_password_hasher(settings)` call per process.** It pre-bakes a dummy hash for the constant-time decoy; rebuilding it per request wastes ~100 ms each time.
-- **`get_user_fn` is the only piece that knows your schema.** Nested `auth.username`, flat `email`, an influencer table — they all collapse into the same `UserRecord` shape here. If you need to change which collection or field stores users, this function is the single edit.
-- **`prefix=` must agree with the frontend.** The library default is `/api/auth`. Override it to keep an existing client working (`/api/jwt` in this example). Set `AUTH_REFRESH_COOKIE_PATH` to `<prefix>/refresh` so the cookie scope matches the route.
+- **One `AuthSettings()` call per process.** Importing `app_auth` triggers env-var parsing; missing `AUTH_KEYCLOAK_URL` or `AUTH_SESSION_SECRET_KEY` fails at import time, which is what you want (loud at boot, not on first login).
+- **`configure_session` must run in `main.py`, before any router.** Attaching it inside `app_auth/__init__.py` wouldn't have an `app` to attach to yet — pass `settings` back out and call it from `main.py` instead.
+- **`get_or_create_user_fn` is optional and enrichment-only.** Use it if a route needs your own business record for the logged-in user; skip it if Keycloak claims + roles are enough on their own.
+- **`prefix=` must agree with the frontend/Keycloak client.** The library default is `/api/auth`. Whatever you pick, register `{AUTH_APP_BASE_URL}{prefix}/callback` as a Valid Redirect URI on the Keycloak client.
 - **Don't re-export `auth` itself.** Always do `from app_auth import require_roles`, never `from auth import ...` in route files — that keeps the wiring single-sourced and stops the package-name collision from biting you later.
 
 ---
 
-## Hashing a password (registration / seed scripts)
+## Migration notes (from the old password/JWT version)
 
-```python
-from auth import AuthSettings, make_password_hasher
+This is a breaking rewrite — v0.1.x's username/password login is gone
+entirely, replaced by Keycloak. Note in particular:
 
-settings = AuthSettings()
-hasher = make_password_hasher(settings)
-
-stored = hasher.hash("hunter2-correct-horse")
-# Persist `stored` in your user document, e.g. auth.password_hash = stored
-```
-
-The same `AUTH_PEPPER_SECRET` must be set in every environment that hashes or verifies passwords. Rotating the pepper invalidates all existing stored hashes.
+- **`POST /login` (JSON body) → `GET /login` (browser redirect).** The SPA
+  can no longer `fetch()` a login; it must navigate the browser
+  (`window.location.href = "/api/auth/login"` or a plain `<a href>`) so
+  Keycloak's own login page can render.
+- **No access token is ever returned to the client.** Previously,
+  `POST /login` handed back `{"token": "..."}` for the SPA to hold in
+  memory and send as `Authorization: Bearer`. Now, protected routes rely
+  entirely on the session cookie — there is nothing for the SPA to attach
+  to outgoing requests beyond `credentials: "include"`.
+- **`create_auth_router` dropped `hasher` and `get_user_fn`.** The new
+  optional parameter is `get_or_create_user_fn(claims: dict) -> dict | None`
+  — same "consumer supplies the DB adapter" shape, different input (Keycloak
+  claims instead of a username) and different semantics (enrichment, not a
+  login gate).
+- **`make_require_roles` reads the session, not a Bearer JWT.** The call
+  shape (`require_roles(["admin"])`, `require_roles.get_current_claims`)
+  is unchanged, so most consumer route code needs no edits beyond how
+  `settings`/`router` get built.
+- **All password-era exports are gone**: `PasswordHasher`,
+  `make_password_hasher`, `create_access_token`, `create_refresh_token`,
+  `decode_token`, `InLogin`, `TokenResponse`, `UserRecord`. There is no
+  drop-in replacement for password hashing — Keycloak owns credentials now.
 
 ---
 
-## The `UserRecord` shape
+## The session `user` shape
 
-Your `get_user_fn` must return either `None` or a `UserRecord`:
+After a successful login, `request.session["user"]` (and `GET /me`'s
+`user` field) looks like:
 
 ```python
-class UserRecord(BaseModel):
-    identity: str            # goes into JWT `sub`
-    password_hash: str       # argon2id PHC string from a previous hasher.hash() call
-    roles: list[str] = []    # used by require_roles(...)
-    is_active: bool = True   # False → 403 at login
-    extra_claims: dict = {}  # optional, merged into JWT (e.g. {"account_type": "influencer"})
+{
+    "sub": "f3b2...",                    # Keycloak's stable subject id
+    "preferred_username": "alice",
+    "email": "alice@example.com",
+    "name": "Alice Papadopoulou",
+    "roles": ["admin"],                  # from extract_roles(), per AUTH_ROLES_SOURCE
+    "local": {...},                      # only present if get_or_create_user_fn returned non-None
+}
 ```
-
-Adapt nested documents (e.g. `personnel.auth.username`) or flat ones (e.g. an influencer collection) the same way — the library only sees the normalized record.
 
 ---
 
 ## Security model
 
-- **Password storage**: `argon2id(HMAC-SHA256(pepper, password), salt, t, m, p)`. Salt is per-password and stored inside the PHC string. Pepper is environment-only.
-- **Pepper applied as HMAC**: protects against password shucking when paired with secret pepper management.
-- **JWT signing**: HMAC (default `HS256`) over `AUTH_JWT_SECRET_KEY`.
-- **Refresh token**: `HttpOnly` cookie scoped to `refresh_cookie_path`; `Secure` + `SameSite=Strict` by default.
-- **Username enumeration**: missing-user login path runs `hasher.dummy_verify()` so wrong-username and wrong-password paths take equivalent wall-clock time.
-- **Disabled accounts**: `is_active=False` returns 403 at login, and `/refresh` also re-checks `is_active` so a disabled user cannot keep refreshing.
+- **Login/session, not password storage.** Keycloak verifies credentials; this library never sees a password.
+- **Session cookie**: itsdangerous-signed via Starlette's `SessionMiddleware`, `HttpOnly` by default, `SameSite=Lax` (hardcoded — Keycloak's redirect back is a top-level cross-site navigation, `Strict` would silently break login), `Secure` per `AUTH_SESSION_HTTPS_ONLY`.
+- **CSRF on login**: `state` is generated per `/login` call, stashed in the session, and checked on `/callback` before any token exchange happens.
+- **RP-initiated logout**: `/logout` clears the local session and redirects through Keycloak's `end_session_endpoint` with `id_token_hint`, ending the realm-wide SSO session too — not just this app's.
+- **Tokens never reach the browser.** Keycloak's `access_token`/`refresh_token` are used once server-side (the userinfo call during `/callback`) and then discarded, not persisted — mirroring `keycloak-sample-client`'s reasoning: nothing calls a protected API with them today, and keeping more risks exceeding proxy header buffers / the ~4KB per-cookie browser limit.
+- **Revocation**: none of this is revocable mid-session beyond clearing the local cookie — Keycloak's own SSO session ends via `/logout`, but a session that was never explicitly logged out lives until `AUTH_SESSION_MAX_AGE_SECONDS` expires.
 
 ### Operational checklist
 
-- [ ] `AUTH_JWT_SECRET_KEY` and `AUTH_PEPPER_SECRET` set per environment, never committed.
+- [ ] `AUTH_SESSION_SECRET_KEY` set per environment, never committed.
 - [ ] Different secrets in dev / staging / prod.
 - [ ] Secrets stored in your secret manager (Vault, AWS SM, …), not in `.env` files in production.
-- [ ] `AUTH_SECURE_COOKIE=true` in any environment served over HTTPS.
-- [ ] Argon2id parameters tuned to ~100 ms per hash on your prod host.
+- [ ] `AUTH_SESSION_HTTPS_ONLY=true` in any environment served over HTTPS.
+- [ ] Keycloak client's Valid Redirect URIs exactly match `{AUTH_APP_BASE_URL}{prefix}/callback`.
+- [ ] "roles" client scope configured as Default with "Add to ID token" enabled, if any route uses `require_roles([...])` with non-empty roles.
+- [ ] Running against a dedicated realm, not `master`.
 
 ---
 
@@ -371,108 +368,64 @@ pytest -q
 
 ```bash
 python -m build
-# → dist/iassis_auth-0.1.0-py3-none-any.whl
+# → dist/iassis_auth-0.2.0-py3-none-any.whl
 ```
 
-### Run end-to-end against a throwaway FastAPI app
+### Run end-to-end against a real Keycloak instance
 
-Stand the library up in isolation — no database, in-memory users, single uvicorn process. Useful for verifying changes before touching a consumer service.
+Unlike the old password-based version, there's no way to demo this
+library with zero external services — it needs a Keycloak realm to
+redirect to. The quickest path is a local throwaway instance:
 
 ```bash
-# 1. Activate the dev venv (see "Set up" above).
-# 2. Export the two required secrets:
-export AUTH_JWT_SECRET_KEY=$(python -c "import secrets; print(secrets.token_urlsafe(64))")
-export AUTH_PEPPER_SECRET=$(python -c "import secrets; print(secrets.token_urlsafe(64))")
-export AUTH_SECURE_COOKIE=false        # local HTTP
+docker run -p 8080:8080 -e KEYCLOAK_ADMIN=admin -e KEYCLOAK_ADMIN_PASSWORD=admin \
+    quay.io/keycloak/keycloak:latest start-dev
+```
 
-# 3. Save as demo.py:
+Then, in the admin console (`http://localhost:8080`):
+
+1. Create a realm (anything other than `master`).
+2. Create a confidential client, e.g. `demo-client`, with Standard Flow
+   enabled and a Valid Redirect URI of `http://localhost:8000/api/auth/callback`.
+3. Copy its client secret from the Credentials tab.
+
+```bash
+export AUTH_KEYCLOAK_URL=http://localhost:8080
+export AUTH_KEYCLOAK_REALM=your-realm
+export AUTH_KEYCLOAK_CLIENT_ID=demo-client
+export AUTH_KEYCLOAK_CLIENT_SECRET=<paste secret>
+export AUTH_APP_BASE_URL=http://localhost:8000
+export AUTH_SESSION_SECRET_KEY=$(python -c "import secrets; print(secrets.token_urlsafe(64))")
+export AUTH_SESSION_HTTPS_ONLY=false
+
 cat > demo.py <<'PY'
 from fastapi import Depends, FastAPI
-from auth import (
-    AuthSettings, UserRecord,
-    create_auth_router, make_password_hasher, make_require_roles,
-)
+from auth import AuthSettings, configure_session, create_auth_router, make_require_roles
 
 settings = AuthSettings()
-hasher = make_password_hasher(settings)
 require_roles = make_require_roles(settings)
 
-# Pre-hash one in-memory user.
-USERS = {
-    "alice": UserRecord(
-        identity="alice",
-        password_hash=hasher.hash("hunter2"),
-        roles=["admin"],
-    ),
-}
-
 app = FastAPI()
-app.include_router(create_auth_router(
-    settings=settings,
-    hasher=hasher,
-    get_user_fn=lambda u: USERS.get(u),
-))
+configure_session(app, settings)
+app.include_router(create_auth_router(settings=settings))
 
 @app.get("/whoami")
-def whoami(claims: dict = Depends(require_roles(["admin"]))):
-    return claims
+def whoami(user: dict = Depends(require_roles.get_current_claims)):
+    return user
 PY
 
-# 4. Run:
 uvicorn demo:app --reload --port 8000
 ```
 
-Smoke-test from another terminal:
-
-```bash
-# Login (sets HttpOnly refresh cookie, returns access token in body)
-TOKEN=$(curl -s -c cookies.txt -X POST localhost:8000/api/auth/login \
-        -H 'content-type: application/json' \
-        -d '{"username":"alice","password":"hunter2"}' | jq -r .token)
-
-# Hit a protected endpoint
-curl -s localhost:8000/whoami -H "Authorization: Bearer $TOKEN"
-
-# Refresh from the cookie
-curl -s -b cookies.txt -X POST localhost:8000/api/auth/refresh
-
-# Logout (clears cookie)
-curl -s -b cookies.txt -c cookies.txt -X POST localhost:8000/api/auth/logout
-```
-
-### Run in Docker
-
-There is no Dockerfile in this repo — the library has no runtime of its own. Docker comes in only when a **consumer service** installs it. Two patterns:
-
-**Vendored wheel (recommended for slim base images).** See [Installation §3](#3-vendored-wheel--no-network--no-ssh-key-at-install-time). The consumer copies the wheel into its build context and `pip install`s from a local path — no `git`, no SSH key, fast.
-
-**git+ssh with BuildKit.** If a consumer prefers pinning by tag without vendoring, its Dockerfile needs `git` + `openssh-client` and BuildKit SSH forwarding:
-
-```dockerfile
-# syntax=docker/dockerfile:1.4
-FROM python:3.11-slim
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        git openssh-client \
-    && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p -m 0700 ~/.ssh \
-    && ssh-keyscan github.com >> ~/.ssh/known_hosts
-COPY requirements.txt .
-RUN --mount=type=ssh pip install --no-cache-dir -r requirements.txt
-```
-
-Build with the host's SSH agent forwarded:
-
-```bash
-docker build --ssh default -t my-consumer .
-# or, with compose:
-DOCKER_BUILDKIT=1 docker compose build --ssh default
-```
+Open `http://localhost:8000/api/auth/login` in a browser, log in, and
+you'll be redirected back with a session cookie set; `/api/auth/me` and
+`/whoami` will both show the authenticated user.
 
 ### Run the test suite
 
 ```bash
 pytest -q                    # all tests
-pytest -q -k login           # filter
+pytest -q -k callback        # filter
 pytest -q --cov=auth         # with coverage (needs pytest-cov)
 ```
 
@@ -492,21 +445,34 @@ pytest -q --cov=auth         # with coverage (needs pytest-cov)
 
 ---
 
+## What's next
+
+This library is deliberately scoped to **one app's** login/logout/session
+— it does not yet address the org's longer-term goal of logging into one
+app (e.g. an influencer tool) and staying authenticated across other
+platforms (methub, methub API, CRM), or letting one app's SPA call
+another app's backend directly. That design — RFC 8693 Token Exchange,
+one Keycloak client per app, and stateless Bearer-JWT verification on
+each resource server — is written up in `plan-keycloak.md` in this repo.
+None of it is implemented here yet; this single-app BFF pattern is step
+one toward it.
+
+---
+
 ## Public API
 
 ```python
 from auth import (
-    AuthSettings,            # pydantic-settings model, reads AUTH_* env vars
-    UserRecord,              # normalized shape get_user_fn must return
-    InLogin, TokenResponse,  # request / response Pydantic models
-    PasswordHasher,          # struct holding hash / verify / dummy_verify
+    AuthSettings,          # pydantic-settings model, reads AUTH_* env vars
+    ErrorResponse,         # error envelope model (401/403 response docs)
 
-    make_password_hasher,    # (settings, hasher_config_path=None) -> PasswordHasher
-    make_require_roles,      # (settings) -> require_roles(roles) dependency factory
-    create_auth_router,      # (*, settings, hasher, get_user_fn, prefix=...) -> APIRouter
-
-    create_access_token,     # (settings, identity, roles, extra=None) -> str
-    create_refresh_token,    # (settings, identity, roles) -> str
-    decode_token,            # (settings, token) -> dict
+    configure_session,     # (app, settings) -> None — attach the session middleware
+    create_auth_router,    # (*, settings, prefix="/api/auth", get_or_create_user_fn=None) -> APIRouter
+    make_require_roles,    # (settings) -> require_roles(roles) dependency factory
 )
 ```
+
+Lower-level OIDC primitives (`discover`, `build_authorize_url`,
+`exchange_code_for_tokens`, `verify_id_token`, `extract_roles`, ...) live
+in `auth.keycloak` for advanced consumers, but aren't part of the
+top-level public API.
