@@ -96,10 +96,12 @@ def create_auth_router(
         """Complete a Keycloak login and populate the session.
 
         Validates `state`, exchanges `code`, verifies the id_token, fetches
-        userinfo, extracts roles, and (if provided) runs
-        `get_or_create_user_fn` to attach a local record — never to block
-        login. Access/refresh tokens are used once (the userinfo call) and
-        then dropped, not persisted.
+        userinfo, extracts roles (from id_token claims and userinfo
+        combined — Keycloak's default mapper config often only puts roles
+        in one of the two), and (if provided) runs `get_or_create_user_fn`
+        to attach a local record — never to block login. Access/refresh
+        tokens are used once (the userinfo call) and then dropped, not
+        persisted.
 
         Args:
             request: FastAPI request; `oauth_state`/`oauth_silent` read
@@ -137,7 +139,15 @@ def create_auth_router(
             return JSONResponse({"detail": "Invalid id_token"}, status_code=401)
 
         userinfo = await fetch_userinfo(cfg, tokens.get("access_token", ""))
-        roles = extract_roles(settings, claims)
+        # Keycloak's stock "roles" client scope mapper ships with "Add to
+        # access token" on but "Add to ID token"/"Add to userinfo" off by
+        # default, and it's common for a client to have only one of the
+        # latter two enabled. extract_roles() already documents that it
+        # accepts either id_token claims or userinfo — merge both so roles
+        # get picked up wherever the realm actually put them, instead of
+        # requiring every consumer to notice and fix a specific mapper
+        # checkbox before role-based auth silently denies everyone.
+        roles = extract_roles(settings, {**claims, **userinfo})
         local = get_or_create_user_fn(claims) if get_or_create_user_fn else None
 
         user = {

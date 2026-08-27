@@ -140,6 +140,30 @@ def test_callback_happy_path_populates_session_and_redirects(auth_settings, monk
     assert "local" not in body["user"]
 
 
+def test_callback_picks_up_roles_missing_from_id_token_but_present_in_userinfo(auth_settings, monkeypatch):
+    """Keycloak's default 'roles' mapper often adds roles to only one of
+    id_token/userinfo — a client with only 'Add to userinfo' enabled (and
+    not 'Add to ID token') must still end up with roles in the session."""
+    client = TestClient(_make_app(auth_settings))
+    state = _login_and_get_state(client)
+
+    claims_without_roles = {"sub": "alice", "preferred_username": "alice"}
+    monkeypatch.setattr(
+        "auth.router.exchange_code_for_tokens",
+        AsyncMock(return_value={"id_token": "x", "access_token": "y"}),
+    )
+    monkeypatch.setattr("auth.router.verify_id_token", MagicMock(return_value=claims_without_roles))
+    monkeypatch.setattr(
+        "auth.router.fetch_userinfo",
+        AsyncMock(return_value={"realm_access": {"roles": ["admin"]}}),
+    )
+
+    client.get("/api/auth/callback", params={"code": "abc", "state": state}, follow_redirects=False)
+
+    body = client.get("/api/auth/me").json()
+    assert body["user"]["roles"] == ["admin"]
+
+
 def test_callback_enriches_with_get_or_create_user_fn(auth_settings, monkeypatch):
     client = TestClient(_make_app(auth_settings, get_or_create_user_fn=lambda claims: {"mongo_id": "abc123"}))
     state = _login_and_get_state(client)
