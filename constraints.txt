@@ -15,23 +15,21 @@
 # --- iassis-auth direct deps ---
 fastapi==0.115.6
 PyJWT==2.10.1
-pwdlib==0.2.1
-argon2-cffi==23.1.0
-PyYAML==6.0.2
 pydantic==2.10.4
 pydantic-settings==2.7.0
+httpx==0.28.1
+starlette==0.41.3
+itsdangerous==2.2.0
 
 # --- load-bearing transitives ---
-starlette==0.41.3
 pydantic-core==2.27.2
-argon2-cffi-bindings==21.2.0
 
 # --- common across all consumer projects (not deps of iassis-auth itself,
 #     but every service uses them — pinning here keeps them aligned) ---
 pymongo==4.10.1
 uvicorn==0.34.0
-httpx==0.28.1
 python-multipart==0.0.20
 
 # --- dev / test (only enforced when consumers install dev extras) ---
 pytest==8.3.4
+cryptography==43.0.3

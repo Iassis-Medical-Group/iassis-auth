@@ -1,2 +1,7 @@
 .idea
 fastapi-auth
+__pycache__/
+*.pyc
+.venv/
+dist/
+.DS_Store

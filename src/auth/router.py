@@ -1,192 +1,208 @@
+import secrets
 from typing import Callable
 
+import httpx
 import jwt
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse, RedirectResponse
 
 from .config import AuthSettings
-from .models import ErrorResponse, InLogin, TokenResponse, UserRecord
-from .security import (
-    PasswordHasher,
-    create_access_token,
-    create_refresh_token,
-    decode_token,
+from .keycloak import (
+    build_authorize_url,
+    build_end_session_url,
+    discover,
+    exchange_code_for_tokens,
+    extract_roles,
+    fetch_userinfo,
+    verify_id_token,
 )
 
-
-GetUserFn = Callable[[str], UserRecord | None]
+GetOrCreateUserFn = Callable[[dict], dict | None]
 
 
 def create_auth_router(
     *,
     settings: AuthSettings,
-    hasher: PasswordHasher,
-    get_user_fn: GetUserFn,
     prefix: str = "/api/auth",
+    get_or_create_user_fn: GetOrCreateUserFn | None = None,
 ) -> APIRouter:
-    """Build a FastAPI router exposing `/login`, `/refresh`, and `/logout`.
+    """Build a FastAPI router exposing Keycloak login/logout via a session.
 
-    The library performs no DB I/O itself — `get_user_fn` is what knows
-    where users live and how to read them. Return `None` when the user
-    does not exist; the router handles the constant-time decoy.
+    All four routes are `GET` — this is a browser-redirect flow, not a JSON
+    API. No token is ever handed to the browser; the session cookie (set up
+    separately via `configure_session`) is the only thing the client holds.
+
+    Requires `SessionMiddleware` to already be attached to the app (see
+    `configure_session`) — every route here reads/writes `request.session`.
 
     Args:
-        settings: Loaded `AuthSettings` (env-driven). Provides JWT secret,
-            algorithm, TTLs, cookie config.
-        hasher: A `PasswordHasher` built via `make_password_hasher(settings)`.
-            Carries the deployment pepper.
-        get_user_fn: Callback `(identity: str) -> UserRecord | None`.
-            Consumer-supplied; queries the user collection and adapts the
-            document into `UserRecord`.
-        prefix: URL prefix for the mounted routes. Defaults to `/api/auth`.
+        settings: Loaded `AuthSettings`.
+        prefix: URL prefix for the mounted routes. Also used to derive the
+            callback URL registered with Keycloak
+            (`{settings.app_base_url}{prefix}/callback`).
+        get_or_create_user_fn: Optional callback `(claims: dict) -> dict | None`
+            for syncing a local user record on login. Enrichment only —
+            Keycloak alone decides who can authenticate. If it returns
+            `None`, login still succeeds; the session's `user` dict just
+            has no `local` key.
 
     Returns:
-        APIRouter with three endpoints under `prefix`. Mount with
-        `app.include_router(...)`.
+        APIRouter with `/login`, `/callback`, `/logout`, `/me` under
+        `prefix`. Mount with `app.include_router(...)`.
     """
     router = APIRouter(prefix=prefix, tags=["auth"])
+    redirect_uri = f"{settings.app_base_url}{prefix}/callback"
 
-    @router.post(
+    @router.get(
         "/login",
-        response_model=TokenResponse,
-        status_code=200,
-        summary="Authenticate user and issue tokens",
-        response_description="Access token in body; refresh token set as HttpOnly cookie.",
-        responses={
-            401: {
-                "model": ErrorResponse,
-                "description": "Invalid credentials or unknown user.",
-            },
-        },
+        summary="Redirect to Keycloak's login page",
+        response_description="302 redirect to Keycloak's authorization endpoint.",
     )
-    def login(body: InLogin, response: Response) -> TokenResponse:
-        """Verify credentials and issue an access + refresh token pair.
-
-        On success:
-            * Sets `refresh_token` as an HttpOnly, SameSite=Strict cookie
-              scoped to `AUTH_REFRESH_COOKIE_PATH`.
-            * Returns the access token in the response body.
-
-        Constant-time decoy hashing runs on the missing-user path so that
-        wrong-username and wrong-password requests take equivalent wall-
-        clock time, preventing username enumeration.
+    async def login(request: Request, prompt: str | None = None) -> RedirectResponse:
+        """Start a Keycloak login: stash CSRF state in the session and redirect.
 
         Args:
-            body: JSON body with `username` and `password`.
-            response: FastAPI response object used to set the cookie.
+            request: FastAPI request; `state` is stored on `request.session`.
+            prompt: Optional OIDC `prompt` passthrough (e.g. `prompt=none`
+                for a silent SSO probe from the SPA).
 
         Returns:
-            `TokenResponse` containing the short-lived access token.
-
-        Raises:
-            HTTPException 401: Unknown user or wrong password.
+            302 redirect to Keycloak's authorization endpoint.
         """
-        user = get_user_fn(body.username)
-        if user is None or not user.is_active:
-            hasher.dummy_verify()
-            raise HTTPException(status_code=401, detail="Unauthorized")
-        if not hasher.verify(body.password, user.password_hash):
-            raise HTTPException(status_code=401, detail="Unauthorized")
-
-        refresh_token = create_refresh_token(settings, user.identity, user.roles)
-        response.set_cookie(
-            key="refresh_token",
-            value=refresh_token,
-            httponly=True,
-            secure=settings.secure_cookie,
-            samesite=settings.cookie_samesite,
-            max_age=settings.refresh_ttl_minutes * 60,
-            path=settings.refresh_cookie_path,
+        cfg = await discover(settings)
+        state = secrets.token_urlsafe(24)
+        request.session["oauth_state"] = state
+        if prompt:
+            request.session["oauth_silent"] = prompt == "none"
+        return RedirectResponse(
+            build_authorize_url(cfg, settings, redirect_uri=redirect_uri, state=state, prompt=prompt)
         )
-        access_token = create_access_token(
-            settings, user.identity, user.roles, user.extra_claims
-        )
-        return TokenResponse(token=access_token)
 
-    @router.post(
-        "/refresh",
-        response_model=TokenResponse,
-        status_code=200,
-        summary="Mint a new access token from the refresh cookie",
-        response_description="New access token in the response body.",
+    @router.get(
+        "/callback",
+        response_model=None,
+        summary="Handle Keycloak's redirect back after login",
+        response_description="302 redirect to the app's post-login path; session populated.",
         responses={
-            401: {
-                "model": ErrorResponse,
-                "description": (
-                    "Refresh cookie missing, invalid, expired, of the wrong "
-                    "token type, or user is no longer active."
-                ),
-            },
+            401: {"description": "Missing/mismatched state, token exchange failure, or invalid id_token."},
         },
     )
-    def refresh(request: Request) -> TokenResponse:
-        """Exchange a valid refresh cookie for a new access token.
+    async def callback(
+        request: Request,
+        code: str | None = None,
+        state: str | None = None,
+        error: str | None = None,
+    ):
+        """Complete a Keycloak login and populate the session.
 
-        The refresh cookie is signed with the same secret as access tokens
-        but carries `type=refresh`. This endpoint:
-
-            1. Reads the `refresh_token` cookie.
-            2. Verifies signature, expiry, and `type=refresh`.
-            3. Re-fetches the user via `get_user_fn` (so a disabled user
-               cannot keep refreshing with an old role set).
-            4. Mints a new access token with the user's current roles and
-               `extra_claims`.
+        Validates `state`, exchanges `code`, verifies the id_token, fetches
+        userinfo, extracts roles, and (if provided) runs
+        `get_or_create_user_fn` to attach a local record — never to block
+        login. Access/refresh tokens are used once (the userinfo call) and
+        then dropped, not persisted.
 
         Args:
-            request: FastAPI request; cookie is read from `request.cookies`.
+            request: FastAPI request; `oauth_state`/`oauth_silent` read
+                from and CSRF-checked against `request.session`.
+            code: Authorization code query param.
+            state: CSRF state query param.
+            error: OIDC error query param, set by Keycloak instead of
+                `code` when e.g. a silent (`prompt=none`) probe finds no
+                existing SSO session.
 
         Returns:
-            `TokenResponse` with a freshly-minted access token.
-
-        Raises:
-            HTTPException 401: Missing/invalid/expired refresh token, wrong
-                token type, or the user is no longer active.
+            302 redirect to `settings.post_login_redirect_path` on success.
+            A JSON 401 response on failure (or a silent redirect home, for
+            a failed silent-SSO probe).
         """
-        token = request.cookies.get("refresh_token")
-        if not token:
-            raise HTTPException(status_code=401, detail="Missing refresh token")
+        silent = request.session.pop("oauth_silent", False)
+        if error:
+            if silent:
+                return RedirectResponse(settings.app_base_url + settings.post_login_redirect_path)
+            return JSONResponse({"detail": error}, status_code=401)
+        if not code or not state or state != request.session.get("oauth_state"):
+            return JSONResponse({"detail": "Invalid or missing state"}, status_code=401)
+
+        cfg = await discover(settings)
+        try:
+            tokens = await exchange_code_for_tokens(cfg, settings, code=code, redirect_uri=redirect_uri)
+        except httpx.HTTPStatusError:
+            return JSONResponse({"detail": "Token exchange failed"}, status_code=401)
 
         try:
-            payload = decode_token(settings, token)
+            claims = verify_id_token(settings, tokens["id_token"])
         except jwt.ExpiredSignatureError:
-            raise HTTPException(status_code=401, detail="Refresh token has expired")
+            return JSONResponse({"detail": "id_token has expired"}, status_code=401)
         except jwt.InvalidTokenError:
-            raise HTTPException(status_code=401, detail="Invalid refresh token")
+            return JSONResponse({"detail": "Invalid id_token"}, status_code=401)
 
-        if payload.get("type") != "refresh":
-            raise HTTPException(status_code=401, detail="Invalid token type")
+        userinfo = await fetch_userinfo(cfg, tokens.get("access_token", ""))
+        roles = extract_roles(settings, claims)
+        local = get_or_create_user_fn(claims) if get_or_create_user_fn else None
 
-        identity = payload["sub"]
-        user = get_user_fn(identity)
-        if user is None or not user.is_active:
-            raise HTTPException(status_code=401, detail="Unauthorized")
+        user = {
+            "sub": claims["sub"],
+            "preferred_username": userinfo.get("preferred_username") or claims.get("preferred_username"),
+            "email": userinfo.get("email") or claims.get("email"),
+            "name": userinfo.get("name") or claims.get("name"),
+            "roles": roles,
+        }
+        if local is not None:
+            user["local"] = local
 
-        access_token = create_access_token(
-            settings, user.identity, user.roles, user.extra_claims
-        )
-        return TokenResponse(token=access_token)
+        request.session["user"] = user
+        request.session["id_token"] = tokens.get("id_token")
+        request.session.pop("oauth_state", None)
 
-    @router.post(
+        return RedirectResponse(settings.app_base_url + settings.post_login_redirect_path)
+
+    @router.get(
         "/logout",
-        status_code=200,
-        summary="Clear the refresh cookie",
-        response_description="`{ msg: 'Logout successful' }`",
+        summary="Clear the session and end the Keycloak SSO session",
+        response_description="302 redirect to Keycloak's end-session endpoint (or the app's post-logout path).",
     )
-    def logout(response: Response) -> dict:
-        """Delete the `refresh_token` cookie.
-
-        Access tokens are not revoked server-side — the client must drop
-        the access token from memory separately. Once the refresh cookie
-        is gone, the client cannot mint new access tokens.
+    async def logout(request: Request) -> RedirectResponse:
+        """Clear the local session and redirect to Keycloak's RP-initiated logout.
 
         Args:
-            response: FastAPI response object used to clear the cookie.
+            request: FastAPI request; session is read then cleared.
 
         Returns:
-            A confirmation message.
+            302 redirect to `end_session_endpoint` (ends Keycloak's SSO
+            session too) if the realm advertises one, else a redirect to
+            `settings.post_logout_redirect_path`.
         """
-        response.delete_cookie(
-            key="refresh_token", path=settings.refresh_cookie_path
+        cfg = await discover(settings)
+        id_token = request.session.get("id_token")
+        request.session.clear()
+
+        end_session_url = build_end_session_url(
+            cfg,
+            post_logout_redirect_uri=settings.app_base_url + settings.post_logout_redirect_path,
+            id_token=id_token,
         )
-        return {"msg": "Logout successful"}
+        return RedirectResponse(end_session_url or (settings.app_base_url + settings.post_logout_redirect_path))
+
+    @router.get(
+        "/me",
+        response_model=None,
+        summary="Return the current session's authentication state",
+    )
+    def me(request: Request) -> dict:
+        """Report whether the caller has an authenticated session.
+
+        Args:
+            request: FastAPI request; reads `request.session["user"]`.
+
+        Returns:
+            `{"authenticated": False}`, or
+            `{"authenticated": True, "user": {...}}` with the dict stored
+            at login time (`sub`, `preferred_username`, `email`, `name`,
+            `roles`, optional `local`).
+        """
+        user = request.session.get("user")
+        if user is None:
+            return {"authenticated": False}
+        return {"authenticated": True, "user": user}
 
     return router
