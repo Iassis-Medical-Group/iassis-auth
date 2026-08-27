@@ -4,18 +4,17 @@ Framework-thin: every function takes `AuthSettings` explicitly and does
 one thing (discover, build a URL, exchange a code, verify a token). The
 actual FastAPI routes live in `router.py`, which composes these.
 """
-
-from urllib.parse import urlencode
-
-import httpx
 import jwt
+import time
+import httpx
 
 from .config import AuthSettings
+from urllib.parse import urlencode
 
 # Keyed by issuer URL rather than a single global dict, so a process that
 # ever builds more than one AuthSettings (e.g. tests) doesn't cross-pollute.
-_discovery_cache: dict[str, dict] = {}
-
+_discovery_cache: dict[str, tuple[float, dict]] = {}
+_DISCOVERY_TTL_SECONDS = 300  # 5 minutes
 
 def _issuer(settings: AuthSettings) -> str:
     return f"{settings.keycloak_url}/realms/{settings.keycloak_realm}"
@@ -28,8 +27,8 @@ def _jwks_client(settings: AuthSettings) -> jwt.PyJWKClient:
 async def discover(settings: AuthSettings) -> dict:
     """Fetch and cache the realm's OIDC discovery document.
 
-    Cached for the lifetime of the process, keyed by issuer URL, so this
-    is a no-op HTTP-wise after the first call per realm.
+    Cached per issuer URL for up to `_DISCOVERY_TTL_SECONDS`; a stale
+    entry triggers exactly one re-fetch on the next call.
 
     Args:
         settings: Loaded `AuthSettings`.
@@ -39,12 +38,19 @@ async def discover(settings: AuthSettings) -> dict:
         `userinfo_endpoint`, `end_session_endpoint`, etc).
     """
     issuer = _issuer(settings)
-    if issuer not in _discovery_cache:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(f"{issuer}/.well-known/openid-configuration")
-            resp.raise_for_status()
-            _discovery_cache[issuer] = resp.json()
-    return _discovery_cache[issuer]
+    cached = _discovery_cache.get(issuer)
+    if cached is not None:
+        fetched_at, doc = cached
+        if time.monotonic() - fetched_at < _DISCOVERY_TTL_SECONDS:
+            return doc
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(f"{issuer}/.well-known/openid-configuration")
+        resp.raise_for_status()
+        doc = resp.json()
+
+    _discovery_cache[issuer] = (time.monotonic(), doc)
+    return doc
 
 
 def build_authorize_url(

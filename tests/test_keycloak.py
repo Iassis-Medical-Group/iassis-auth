@@ -126,6 +126,43 @@ class TestDiscover:
         assert cfg1 == cfg2
         assert calls["n"] == 1
 
+    def test_refetches_after_ttl_expires(self, auth_settings, monkeypatch):
+        calls = {"n": 0}
+
+        class _Resp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"authorization_endpoint": "https://kc.example.com/auth"}
+
+        class _FakeAsyncClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def get(self, url):
+                calls["n"] += 1
+                return _Resp()
+
+        monkeypatch.setattr(keycloak.httpx, "AsyncClient", lambda: _FakeAsyncClient())
+
+        fake_now = {"t": 1000.0}
+        monkeypatch.setattr(keycloak.time, "monotonic", lambda: fake_now["t"])
+
+        asyncio.run(keycloak.discover(auth_settings))
+        assert calls["n"] == 1
+
+        fake_now["t"] += keycloak._DISCOVERY_TTL_SECONDS - 1
+        asyncio.run(keycloak.discover(auth_settings))
+        assert calls["n"] == 1, "still within TTL, should not re-fetch"
+
+        fake_now["t"] += 2
+        asyncio.run(keycloak.discover(auth_settings))
+        assert calls["n"] == 2, "past TTL, should re-fetch"
+
 
 class TestBuildAuthorizeUrl:
     _cfg = {"authorization_endpoint": "https://kc.example.com/realms/testrealm/protocol/openid-connect/auth"}
