@@ -10,7 +10,12 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 from auth import AuthSettings
 from auth import keycloak
-from auth.keycloak import build_authorize_url, extract_roles, verify_id_token
+from auth.keycloak import (
+    build_authorize_url,
+    extract_roles,
+    read_access_token_claims,
+    verify_id_token,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -210,3 +215,23 @@ class TestExtractRoles:
 
     def test_no_roles_claims_returns_empty(self, auth_settings):
         assert extract_roles(auth_settings, {"sub": "alice"}) == []
+
+    def test_unions_across_multiple_sources(self, auth_settings):
+        settings = auth_settings.model_copy(update={"roles_source": "both"})
+        id_claims = {"sub": "alice"}
+        userinfo = {"realm_access": {"roles": ["staff"]}}
+        access_claims = {"resource_access": {"my-client": {"roles": ["editor"]}}}
+        assert extract_roles(settings, id_claims, userinfo, access_claims) == ["editor", "staff"]
+
+    def test_empty_source_dicts_are_harmless(self, auth_settings):
+        assert extract_roles(auth_settings, {}, {}, self._claims) == ["admin", "editor", "staff"]
+
+
+class TestReadAccessTokenClaims:
+    def test_decodes_without_signature_verification(self):
+        token = jwt.encode({"realm_access": {"roles": ["admin"]}}, "x" * 32, algorithm="HS256")
+        assert read_access_token_claims(token) == {"realm_access": {"roles": ["admin"]}}
+
+    def test_opaque_or_malformed_token_returns_empty_dict(self):
+        assert read_access_token_claims("not-a-jwt") == {}
+        assert read_access_token_claims("") == {}

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "iassis-auth"
-version = "0.2.0"
+version = "0.3.0"
 description = "Shared FastAPI authentication library for IASSIS Medical Group internal services."
 readme = "README.md"
 requires-python = ">=3.11"

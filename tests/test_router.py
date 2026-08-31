@@ -164,8 +164,40 @@ def test_callback_picks_up_roles_missing_from_id_token_but_present_in_userinfo(a
     assert body["user"]["roles"] == ["admin"]
 
 
+def test_callback_picks_up_roles_only_in_access_token(auth_settings, monkeypatch):
+    """A fully default Keycloak client emits realm/client roles ONLY in the
+    access token (not id_token, not userinfo) — they must still reach the
+    session."""
+    client = TestClient(_make_app(auth_settings))
+    state = _login_and_get_state(client)
+
+    access_token = jwt.encode(
+        {"realm_access": {"roles": ["admin"]}}, "x" * 32, algorithm="HS256"
+    )
+    monkeypatch.setattr(
+        "auth.router.exchange_code_for_tokens",
+        AsyncMock(return_value={"id_token": "x", "access_token": access_token}),
+    )
+    monkeypatch.setattr(
+        "auth.router.verify_id_token",
+        MagicMock(return_value={"sub": "alice", "preferred_username": "alice"}),
+    )
+    monkeypatch.setattr("auth.router.fetch_userinfo", AsyncMock(return_value={}))
+
+    client.get("/api/auth/callback", params={"code": "abc", "state": state}, follow_redirects=False)
+
+    body = client.get("/api/auth/me").json()
+    assert body["user"]["roles"] == ["admin"]
+
+
 def test_callback_enriches_with_get_or_create_user_fn(auth_settings, monkeypatch):
-    client = TestClient(_make_app(auth_settings, get_or_create_user_fn=lambda claims: {"mongo_id": "abc123"}))
+    seen = {}
+
+    def _fn(claims):
+        seen.update(claims)
+        return {"mongo_id": "abc123"}
+
+    client = TestClient(_make_app(auth_settings, get_or_create_user_fn=_fn))
     state = _login_and_get_state(client)
 
     monkeypatch.setattr(
@@ -179,6 +211,9 @@ def test_callback_enriches_with_get_or_create_user_fn(auth_settings, monkeypatch
 
     body = client.get("/api/auth/me").json()
     assert body["user"]["local"] == {"mongo_id": "abc123"}
+    # the fn sees resolved roles alongside the id_token claims, not bare claims
+    assert seen["roles"] == ["admin"]
+    assert seen["sub"] == "alice"
 
 
 def test_callback_login_succeeds_when_user_sync_returns_none(auth_settings, monkeypatch):
