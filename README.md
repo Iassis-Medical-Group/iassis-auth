@@ -121,6 +121,7 @@ All settings are read from environment variables (or a `.env` file) prefixed wit
 | `AUTH_SESSION_MAX_AGE_SECONDS` | int or unset | Starlette default (14 days) | |
 | `AUTH_SESSION_HTTPS_ONLY` | bool | `true` | Set `false` only for local HTTP dev. |
 | `AUTH_ROLES_SOURCE` | `realm` / `resource` / `both` | `both` | Which claim location `require_roles(...)` reads. |
+| `AUTH_ROLES_EXCLUDE` | comma-separated | `offline_access,uma_authorization` | Role names stripped from the extracted list. Keycloak's stock built-ins ride along in every token and are never app roles. `default-roles-<realm>` is always dropped too. Set to `""` to keep everything. |
 
 Generate strong secrets:
 
@@ -141,7 +142,11 @@ python -c "import secrets; print(secrets.token_urlsafe(64))"
   client works with no mapper change. `roles` still comes back empty if
   the "roles" scope isn't assigned to the client at all, or every one of
   its mappers' "Add to ..." toggles is off — check this first if logins
-  succeed but every protected route 403s.
+  succeed but every protected route 403s. Keycloak's built-in
+  `offline_access` / `uma_authorization` / `default-roles-<realm>` are
+  filtered out here (`AUTH_ROLES_EXCLUDE`), so leave the client's **Full
+  scope allowed** ON — turning it off to hide the built-ins also hides
+  every dynamically-added app role.
 - **Realm**: don't run real app clients against `master` — create a
   dedicated realm for this org's applications.
 

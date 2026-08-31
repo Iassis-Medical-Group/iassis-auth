@@ -33,6 +33,19 @@ class AuthSettings(BaseSettings):
 
     # --- role extraction from Keycloak claims ---
     roles_source: Literal["realm", "resource", "both"] = "both"
+    # Comma-separated role names to drop from the extracted list. Defaults
+    # to Keycloak's stock built-ins, which every user carries and which are
+    # never meaningful app roles. `default-roles-<realm>` (the composite
+    # that bundles those two) is always dropped as well, regardless of this
+    # setting. Set `AUTH_ROLES_EXCLUDE=""` to keep everything.
+    roles_exclude: str = "offline_access,uma_authorization"
+
+    @property
+    def roles_exclude_set(self) -> set[str]:
+        """`roles_exclude` parsed to a set, plus the realm's default-roles composite."""
+        names = {r.strip() for r in self.roles_exclude.split(",") if r.strip()}
+        names.add(f"default-roles-{self.keycloak_realm}")
+        return names
 
     model_config = SettingsConfigDict(
         env_prefix="AUTH_",

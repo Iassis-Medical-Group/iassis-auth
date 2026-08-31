@@ -226,6 +226,24 @@ class TestExtractRoles:
     def test_empty_source_dicts_are_harmless(self, auth_settings):
         assert extract_roles(auth_settings, {}, {}, self._claims) == ["admin", "editor", "staff"]
 
+    def test_strips_keycloak_builtins_by_default(self, auth_settings):
+        claims = {"realm_access": {"roles": ["superadmin", "offline_access", "uma_authorization"]}}
+        assert extract_roles(auth_settings, claims) == ["superadmin"]
+
+    def test_always_strips_default_roles_composite(self, auth_settings):
+        claims = {"realm_access": {"roles": ["superadmin", "default-roles-testrealm"]}}
+        assert extract_roles(auth_settings, claims) == ["superadmin"]
+
+    def test_roles_exclude_empty_keeps_everything(self, auth_settings):
+        settings = auth_settings.model_copy(update={"roles_exclude": ""})
+        claims = {"realm_access": {"roles": ["superadmin", "offline_access"]}}
+        # the default-roles-<realm> composite is still always dropped
+        assert extract_roles(settings, claims) == ["offline_access", "superadmin"]
+
+    def test_roles_exclude_is_configurable(self, auth_settings):
+        settings = auth_settings.model_copy(update={"roles_exclude": "staff, editor"})
+        assert extract_roles(settings, self._claims) == ["admin"]
+
 
 class TestReadAccessTokenClaims:
     def test_decodes_without_signature_verification(self):

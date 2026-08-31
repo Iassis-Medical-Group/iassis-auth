@@ -244,17 +244,23 @@ def extract_roles(settings: AuthSettings, *claim_sources: dict) -> list[str]:
     roles found in each. Pass the verified id_token claims, the userinfo
     response, and `read_access_token_claims(access_token)` together.
 
+    Roles listed in `settings.roles_exclude` (default: Keycloak's stock
+    `offline_access` / `uma_authorization`, always plus the realm's
+    `default-roles-<realm>` composite) are stripped from the result — those
+    ride along in `realm_access.roles` on every login and are never
+    meaningful app roles.
+
     Args:
         settings: Loaded `AuthSettings`. `roles_source` picks which of the
-            two claim locations to read.
+            two claim locations to read; `roles_exclude` filters the result.
         *claim_sources: One or more claim dicts (verified id_token claims,
             userinfo, decoded access token). Missing keys are ignored, so
             passing `{}` is harmless.
 
     Returns:
-        Sorted, deduplicated list of role names. Empty if none are present
-        in any source (in which case none of the mappers above put roles
-        anywhere this library can read).
+        Sorted, deduplicated list of role names, minus the excluded set.
+        Empty if none are present in any source (in which case none of the
+        mappers above put roles anywhere this library can read).
     """
     roles: set[str] = set()
     for claims in claim_sources:
@@ -263,4 +269,4 @@ def extract_roles(settings: AuthSettings, *claim_sources: dict) -> list[str]:
         if settings.roles_source in ("resource", "both"):
             resource = claims.get("resource_access", {}).get(settings.keycloak_client_id, {})
             roles |= set(resource.get("roles", []))
-    return sorted(roles)
+    return sorted(roles - settings.roles_exclude_set)
