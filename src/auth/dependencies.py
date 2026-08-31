@@ -16,11 +16,13 @@ def make_require_roles(settings: AuthSettings):
     `/callback` — requires `SessionMiddleware` to be attached (see
     `configure_session`).
 
-    Note: Keycloak only puts roles into claims when the client's "roles"
-    client scope is a Default scope with "Add to ID token" enabled on its
-    mappers. Without that, `user["roles"]` is silently always empty and
-    every `require_roles([...])` call denies everyone with no obvious
-    error — check the Keycloak client config first if this happens.
+    Note: roles are resolved in `/callback` from the id_token, userinfo,
+    and the access token combined (see `keycloak.extract_roles`). The
+    stock "roles" client scope puts them in the access token, so a default
+    client needs no mapper change. `user["roles"]` only comes back empty
+    if that scope isn't assigned to the client at all, or every one of its
+    mappers is turned off — in which case `require_roles([...])` denies
+    everyone with no obvious error, so check the client config first.
 
     Args:
         settings: Loaded `AuthSettings`. Accepted for call-shape parity and

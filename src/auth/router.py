@@ -14,6 +14,7 @@ from .keycloak import (
     exchange_code_for_tokens,
     extract_roles,
     fetch_userinfo,
+    read_access_token_claims,
     verify_id_token,
 )
 
@@ -41,7 +42,9 @@ def create_auth_router(
             callback URL registered with Keycloak
             (`{settings.app_base_url}{prefix}/callback`).
         get_or_create_user_fn: Optional callback `(claims: dict) -> dict | None`
-            for syncing a local user record on login. Enrichment only —
+            for syncing a local user record on login. `claims` is the
+            verified id_token claims plus a `roles` key holding the same
+            resolved role list that lands in the session. Enrichment only —
             Keycloak alone decides who can authenticate. If it returns
             `None`, login still succeeds; the session's `user` dict just
             has no `local` key.
@@ -96,11 +99,12 @@ def create_auth_router(
         """Complete a Keycloak login and populate the session.
 
         Validates `state`, exchanges `code`, verifies the id_token, fetches
-        userinfo, extracts roles (from id_token claims and userinfo
-        combined — Keycloak's default mapper config often only puts roles
-        in one of the two), and (if provided) runs `get_or_create_user_fn`
-        to attach a local record — never to block login. Access/refresh
-        tokens are used once (the userinfo call) and then dropped, not
+        userinfo, extracts roles (from the id_token claims, userinfo, and
+        the unverified access token combined — Keycloak's default mapper
+        config only puts roles in the access token), and (if provided) runs
+        `get_or_create_user_fn` to attach a local record — never to block
+        login. Access/refresh tokens are used server-side during
+        `/callback` (userinfo call + role extraction) and then dropped, not
         persisted.
 
         Args:
@@ -138,17 +142,23 @@ def create_auth_router(
         except jwt.InvalidTokenError:
             return JSONResponse({"detail": "Invalid id_token"}, status_code=401)
 
-        userinfo = await fetch_userinfo(cfg, tokens.get("access_token", ""))
+        access_token = tokens.get("access_token", "")
+        userinfo = await fetch_userinfo(cfg, access_token)
+        access_claims = read_access_token_claims(access_token) if access_token else {}
         # Keycloak's stock "roles" client scope mapper ships with "Add to
         # access token" on but "Add to ID token"/"Add to userinfo" off by
         # default, and it's common for a client to have only one of the
-        # latter two enabled. extract_roles() already documents that it
-        # accepts either id_token claims or userinfo — merge both so roles
-        # get picked up wherever the realm actually put them, instead of
-        # requiring every consumer to notice and fix a specific mapper
-        # checkbox before role-based auth silently denies everyone.
-        roles = extract_roles(settings, {**claims, **userinfo})
-        local = get_or_create_user_fn(claims) if get_or_create_user_fn else None
+        # latter two enabled. Feed all three sources to extract_roles() so
+        # roles get picked up wherever the realm actually put them —
+        # including the access token, which is the only place a fully
+        # default client emits them — instead of requiring every consumer
+        # to notice and fix a specific mapper checkbox before role-based
+        # auth silently denies everyone.
+        roles = extract_roles(settings, claims, userinfo, access_claims)
+        # The fn's contract is "verified identity + resolved roles"; hand it
+        # the same role list that lands in the session, not the bare
+        # id_token claims (which, per the above, often carry no roles).
+        local = get_or_create_user_fn({**claims, "roles": roles}) if get_or_create_user_fn else None
 
         user = {
             "sub": claims["sub"],

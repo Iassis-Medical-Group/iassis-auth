@@ -202,29 +202,71 @@ def build_end_session_url(
     return f"{end_session}?{urlencode(params)}"
 
 
-def extract_roles(settings: AuthSettings, claims: dict) -> list[str]:
-    """Pull role names out of Keycloak's id_token/userinfo claims.
+def read_access_token_claims(access_token: str) -> dict:
+    """Decode a Keycloak access token WITHOUT verifying its signature.
+
+    Only ever called on the `access_token` that arrives in the same token
+    endpoint response as an id_token this library has already fully
+    verified (`verify_id_token`) — same TLS response, same issuer, so the
+    transport trust is already established. Skipping re-verification here
+    avoids a second JWKS fetch on every login.
+
+    Why bother reading it at all: Keycloak's stock "roles" client scope
+    ships with its mappers set to "Add to access token" ON but "Add to ID
+    token"/"Add to userinfo" OFF, so on a default client `realm_access` /
+    `resource_access` appear ONLY in the access token. Feeding this dict to
+    `extract_roles` alongside the id_token/userinfo claims makes role-based
+    auth work with no Keycloak mapper change.
+
+    Args:
+        access_token: The raw access token string from
+            `exchange_code_for_tokens()`.
+
+    Returns:
+        The token's claims, or `{}` if it isn't a decodable JWT (e.g. an
+        IdP that issues opaque access tokens).
+    """
+    try:
+        return jwt.decode(access_token, options={"verify_signature": False})
+    except jwt.InvalidTokenError:
+        return {}
+
+
+def extract_roles(settings: AuthSettings, *claim_sources: dict) -> list[str]:
+    """Pull role names out of one or more Keycloak claim dicts.
 
     Realm roles live at `claims["realm_access"]["roles"]`; client roles for
     this app's own client live at
     `claims["resource_access"][settings.keycloak_client_id]["roles"]`.
-    Neither appears unless the client's "roles" client scope is a Default
-    scope with "Add to ID token" enabled on its mappers.
+    Depending on which of the "roles" client scope's mappers are enabled,
+    those can show up in the id_token, in userinfo, in the access token, or
+    only some of them — so this accepts several claim dicts and unions the
+    roles found in each. Pass the verified id_token claims, the userinfo
+    response, and `read_access_token_claims(access_token)` together.
+
+    Roles listed in `settings.roles_exclude` (default: Keycloak's stock
+    `offline_access` / `uma_authorization`, always plus the realm's
+    `default-roles-<realm>` composite) are stripped from the result — those
+    ride along in `realm_access.roles` on every login and are never
+    meaningful app roles.
 
     Args:
         settings: Loaded `AuthSettings`. `roles_source` picks which of the
-            two claim locations to read.
-        claims: Verified id_token claims (or userinfo, if the same mappers
-            are configured there too).
+            two claim locations to read; `roles_exclude` filters the result.
+        *claim_sources: One or more claim dicts (verified id_token claims,
+            userinfo, decoded access token). Missing keys are ignored, so
+            passing `{}` is harmless.
 
     Returns:
-        Sorted, deduplicated list of role names. Empty if none are present
-        or the mapper config above hasn't been done in Keycloak.
+        Sorted, deduplicated list of role names, minus the excluded set.
+        Empty if none are present in any source (in which case none of the
+        mappers above put roles anywhere this library can read).
     """
     roles: set[str] = set()
-    if settings.roles_source in ("realm", "both"):
-        roles |= set(claims.get("realm_access", {}).get("roles", []))
-    if settings.roles_source in ("resource", "both"):
-        resource = claims.get("resource_access", {}).get(settings.keycloak_client_id, {})
-        roles |= set(resource.get("roles", []))
-    return sorted(roles)
+    for claims in claim_sources:
+        if settings.roles_source in ("realm", "both"):
+            roles |= set(claims.get("realm_access", {}).get("roles", []))
+        if settings.roles_source in ("resource", "both"):
+            resource = claims.get("resource_access", {}).get(settings.keycloak_client_id, {})
+            roles |= set(resource.get("roles", []))
+    return sorted(roles - settings.roles_exclude_set)

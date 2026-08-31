@@ -121,6 +121,7 @@ All settings are read from environment variables (or a `.env` file) prefixed wit
 | `AUTH_SESSION_MAX_AGE_SECONDS` | int or unset | Starlette default (14 days) | |
 | `AUTH_SESSION_HTTPS_ONLY` | bool | `true` | Set `false` only for local HTTP dev. |
 | `AUTH_ROLES_SOURCE` | `realm` / `resource` / `both` | `both` | Which claim location `require_roles(...)` reads. |
+| `AUTH_ROLES_EXCLUDE` | comma-separated | `offline_access,uma_authorization` | Role names stripped from the extracted list. Keycloak's stock built-ins ride along in every token and are never app roles. `default-roles-<realm>` is always dropped too. Set to `""` to keep everything. |
 
 Generate strong secrets:
 
@@ -133,12 +134,19 @@ python -c "import secrets; print(secrets.token_urlsafe(64))"
 - **Redirect URI**: the client's Valid Redirect URIs must include exactly
   `{AUTH_APP_BASE_URL}{prefix}/callback` (default prefix `/api/auth`).
 - **Roles in claims**: `require_roles([...])` reads
-  `realm_access.roles` / `resource_access[client_id].roles` from the
-  verified id_token + userinfo. Those only appear if the client's
-  **"roles" client scope is a Default scope** with **"Add to ID token"**
-  enabled on its mappers. If that's missing, `roles` is silently always
-  empty and every `require_roles([...])` call denies everyone — check
-  this first if logins succeed but every protected route 403s.
+  `realm_access.roles` / `resource_access[client_id].roles`, unioned
+  across three sources during `/callback`: the verified id_token, the
+  userinfo response, and the **unverified access token** (same TLS
+  response as the already-verified id_token). Keycloak's stock "roles"
+  client scope adds roles to the access token only, so a fully default
+  client works with no mapper change. `roles` still comes back empty if
+  the "roles" scope isn't assigned to the client at all, or every one of
+  its mappers' "Add to ..." toggles is off — check this first if logins
+  succeed but every protected route 403s. Keycloak's built-in
+  `offline_access` / `uma_authorization` / `default-roles-<realm>` are
+  filtered out here (`AUTH_ROLES_EXCLUDE`), so leave the client's **Full
+  scope allowed** ON — turning it off to hide the built-ins also hides
+  every dynamically-added app role.
 - **Realm**: don't run real app clients against `master` — create a
   dedicated realm for this org's applications.
 
@@ -340,7 +348,7 @@ After a successful login, `request.session["user"]` (and `GET /me`'s
 - **Session cookie**: itsdangerous-signed via Starlette's `SessionMiddleware`, `HttpOnly` by default, `SameSite=Lax` (hardcoded — Keycloak's redirect back is a top-level cross-site navigation, `Strict` would silently break login), `Secure` per `AUTH_SESSION_HTTPS_ONLY`.
 - **CSRF on login**: `state` is generated per `/login` call, stashed in the session, and checked on `/callback` before any token exchange happens.
 - **RP-initiated logout**: `/logout` clears the local session and redirects through Keycloak's `end_session_endpoint` with `id_token_hint`, ending the realm-wide SSO session too — not just this app's.
-- **Tokens never reach the browser.** Keycloak's `access_token`/`refresh_token` are used once server-side (the userinfo call during `/callback`) and then discarded, not persisted — mirroring `keycloak-sample-client`'s reasoning: nothing calls a protected API with them today, and keeping more risks exceeding proxy header buffers / the ~4KB per-cookie browser limit.
+- **Tokens never reach the browser.** Keycloak's `access_token`/`refresh_token` are used only server-side during `/callback` (the userinfo call, plus an unverified decode of the access token to read role claims) and then discarded, not persisted — mirroring `keycloak-sample-client`'s reasoning: nothing calls a protected API with them today, and keeping more risks exceeding proxy header buffers / the ~4KB per-cookie browser limit. The access token is decoded without signature verification: it rides in the same TLS response as the id_token, whose signature *is* verified, so transport trust is already established.
 - **Revocation**: none of this is revocable mid-session beyond clearing the local cookie — Keycloak's own SSO session ends via `/logout`, but a session that was never explicitly logged out lives until `AUTH_SESSION_MAX_AGE_SECONDS` expires.
 
 ### Operational checklist
@@ -350,7 +358,7 @@ After a successful login, `request.session["user"]` (and `GET /me`'s
 - [ ] Secrets stored in your secret manager (Vault, AWS SM, …), not in `.env` files in production.
 - [ ] `AUTH_SESSION_HTTPS_ONLY=true` in any environment served over HTTPS.
 - [ ] Keycloak client's Valid Redirect URIs exactly match `{AUTH_APP_BASE_URL}{prefix}/callback`.
-- [ ] "roles" client scope configured as Default with "Add to ID token" enabled, if any route uses `require_roles([...])` with non-empty roles.
+- [ ] "roles" client scope assigned to the client (stock default), if any route uses `require_roles([...])` with non-empty roles — roles are read from the access token, so no "Add to ID token" mapper change is needed.
 - [ ] Running against a dedicated realm, not `master`.
 
 ---
@@ -476,6 +484,6 @@ from auth import (
 ```
 
 Lower-level OIDC primitives (`discover`, `build_authorize_url`,
-`exchange_code_for_tokens`, `verify_id_token`, `extract_roles`, ...) live
-in `auth.keycloak` for advanced consumers, but aren't part of the
-top-level public API.
+`exchange_code_for_tokens`, `verify_id_token`, `read_access_token_claims`,
+`extract_roles`, ...) live in `auth.keycloak` for advanced consumers, but
+aren't part of the top-level public API.
